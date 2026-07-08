@@ -196,9 +196,9 @@ _MONTHS = {
 }
 
 date_patterns = [
-    r'(?P<d>\\d{1,2})[^\\w\\s]?(?P<m>\\d{1,2})[^\\w\\s]?(?P<y>\\d{2,4})',
-    r'(?P<y>\\d{4})[^\\w\\s]?(?P<m>\\d{1,2})[^\\w\\s]?(?P<d>\\d{1,2})',
-    r'(?P<d>\\d{1,2})\\s+(?P<mon>[A-Za-z]{3,9})\\.?,?\\s+(?P<y>\\d{2,4})',
+    r'(?P<d>\d{1,2})[^\w\s]?(?P<m>\d{1,2})[^\w\s]?(?P<y>\d{2,4})',
+    r'(?P<y>\d{4})[^\w\s]?(?P<m>\d{1,2})[^\w\s]?(?P<d>\d{1,2})',
+    r'(?P<d>\d{1,2})\s+(?P<mon>[A-Za-z]{3,9})\.?,?\s+(?P<y>\d{2,4})',
 ]
 
 def parse_any_date(val):
@@ -248,19 +248,19 @@ def to_numeric(x):
     )
 
 def normalize_spaces(s: str) -> str:
-    return re.sub(r"\\s+", " ", s.strip())
+    return re.sub(r"\s+", " ", s.strip())
 
 def extract_refs_all(voucher: str, description: str):
     text = f"{voucher or ''} {description or ''}"
 
-    nums = re.findall(r"\\d{6,}", text)
-    alnums = re.findall(r"[A-Za-z0-9][A-Za-z0-9_\\-/:]{3,}", text)
+    nums = re.findall(r"\d{6,}", text)
+    alnums = re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-/:]{3,}", text)
 
     for tok in alnums:
-        nums += re.findall(r"\\d{5,}", tok)
+        nums += re.findall(r"\d{5,}", tok)
 
     latin_names = re.findall(r"[A-Za-z]{3,}", text)
-    arabic_names = re.findall(r"[\\u0600-\\u06FF]{2,}", text)
+    arabic_names = re.findall(r"[\u0600-\u06FF]{2,}", text)
 
     num_set = set(nums)
     alnum_set = {t.upper() for t in alnums if t.upper() not in STOP_TOKENS_LATIN}
