@@ -177,7 +177,7 @@ hr {
 st.markdown("""
 <div class="main-header">
     <h1>🔗 Branch Reconciliation System</h1>
-    <p>Issam Kabbani & Partners Unitech — Treasury Reconciliation Dashboard</p>
+    <p>Issam Kabbani & Partners Unitech —  Reconciliation Dashboard</p>
     <div class="badge-row">
         <span class="badge">✅ Exact Matching</span>
         <span class="badge">📊 KPI Summary</span>
