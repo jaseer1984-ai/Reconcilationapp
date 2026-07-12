@@ -397,85 +397,6 @@ def _auto_pick_other(our_name, names):
     return None
 
 # ================= MATCHING ENGINE =================
-def pair_exact_best(left, right, labelL, labelR, tol, name_thresh=NAME_SIM_THRESHOLD_DEFAULT):
-    ref_index = {}
-
-    for j, r in right.iterrows():
-        toks = r["AllRefs"]
-        if not isinstance(toks, set):
-            toks = set() if pd.isna(toks) else set(toks)
-
-        for tok in toks:
-            ref_index.setdefault(tok, set()).add(j)
-
-    def candidates(lrow):
-        toks = lrow["AllRefs"]
-        if not isinstance(toks, set):
-            toks = set() if pd.isna(toks) else set(toks)
-
-        cand = set()
-        for tok in toks:
-            cand |= ref_index.get(tok, set())
-
-        return list(cand) if cand else list(range(len(right)))
-
-    usedL, usedR, matched = set(), set(), []
-
-    for i, l in left.iterrows():
-        cands = candidates(l)
-
-        if not cands:
-            continue
-
-        def score(j):
-            r = right.loc[j]
-            num_ov = len(l["NumRefs"] & r["NumRefs"])
-            aln_ov = len(l["AlnumRefs"] & r["AlnumRefs"])
-            nm_ov = len(l["NameRefs"] & r["NameRefs"])
-            nm_sim = name_similarity(l["NameRefs"], r["NameRefs"])
-            amt_d = abs(float(l["Amt"]) - float(r["Amt"]))
-            d1, d2 = l["Date"], r["Date"]
-            d_d = abs((d1 - d2).days) if (pd.notna(d1) and pd.notna(d2)) else 10**9
-
-            return (-num_ov, -(aln_ov + nm_ov * 0.5), -int(nm_sim * 1000), amt_d, d_d)
-
-        cands = sorted(cands, key=score)
-
-        for j in cands:
-            if i in usedL or j in usedR:
-                continue
-
-            r = right.loc[j]
-
-            num_ov = len(l["NumRefs"] & r["NumRefs"])
-            tok_ov = len(l["AlnumRefs"] & r["AlnumRefs"])
-            nm_sim = name_similarity(l["NameRefs"], r["NameRefs"])
-
-            if not (num_ov >= 1 or tok_ov >= 1 or nm_sim >= name_thresh):
-                continue
-
-            amt_diff = abs(float(l["Amt"]) - float(r["Amt"]))
-
-            if amt_diff <= tol:
-                matched.append((l, r, round(amt_diff, ROUND_DP)))
-                usedL.add(i)
-                usedR.add(j)
-                break
-
-    match_df = pd.DataFrame([{
-        f"{labelL} Date": a["Date"],
-        f"{labelL} Voucher": a["Voucher"],
-        f"{labelL} Description": a["Description"],
-        f"{labelL} Amount": a["Amt"],
-        f"{labelR} Date": b["Date"],
-        f"{labelR} Voucher": b["Voucher"],
-        f"{labelR} Description": b["Description"],
-        f"{labelR} Amount": b["Amt"],
-        "Amount_Diff": diff
-    } for (a, b, diff) in matched])
-
-    return match_df, usedL, usedR
-
 def pair_exact_best_fast_same(left, right, labelL, labelR, tol, name_thresh=NAME_SIM_THRESHOLD_DEFAULT):
     right_amt = right["Amt"].astype(float).values
 
@@ -569,8 +490,7 @@ def run_recon_core(
     our_sheet_name,
     branch_sheet_name,
     amount_tol,
-    name_sim_thresh,
-    use_fast=False
+    name_sim_thresh
 ):
     xls = pd.ExcelFile(xls_bytes)
     names = xls.sheet_names
@@ -610,11 +530,8 @@ def run_recon_core(
     label_br_dr = "Branch book DR"
     label_br_cr = "Branch book CR"
 
-    matcher = pair_exact_best_fast_same if use_fast else pair_exact_best
+    matcher = pair_exact_best_fast_same
 
-    # Matching rule:
-    # Our Debit should match Branch Credit
-    # Our Credit should match Branch Debit
     m1, usedL1, usedR1 = matcher(
         OUR_DR,
         BR_CR,
@@ -639,7 +556,6 @@ def run_recon_core(
         else pd.DataFrame()
     )
 
-    # Unmatching only excludes exact matches. No partial matching is used.
     un_our = pd.concat([
         OUR_DR.loc[[i for i in OUR_DR.index if i not in usedL1]],
         OUR_CR.loc[[i for i in OUR_CR.index if i not in usedL2]],
@@ -707,14 +623,13 @@ def run_recon_core(
     return matching_df, unmatching_df, out
 
 @st.cache_data(show_spinner=False)
-def run_recon_cached_v2(
+def run_recon_cached_v3(
     file_bytes: bytes,
     our_sheet_name,
     branch_sheet_name,
     amount_tol,
     name_sim_thresh,
-    use_fast,
-    _version: str = "modern-v3"
+    _version: str = "fast-v1"
 ):
     buf = io.BytesIO(file_bytes)
     return run_recon_core(
@@ -722,63 +637,8 @@ def run_recon_cached_v2(
         our_sheet_name,
         branch_sheet_name,
         amount_tol,
-        name_sim_thresh,
-        use_fast
+        name_sim_thresh
     )
-
-# ================= URL HELPERS =================
-def drive_id_from_url(url: str):
-    m = re.search(r"/(?:file|spreadsheets)/d/([A-Za-z0-9_-]+)", url)
-
-    if m:
-        return m.group(1)
-
-    m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", url)
-
-    return m.group(1) if m else None
-
-def onedrive_direct(url: str):
-    if "1drv.ms" in url or "sharepoint.com" in url:
-        if "download=1" not in url:
-            url += ("&" if "?" in url else "?") + "download=1"
-
-    return url
-
-def download_to_temp(url: str) -> str:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-    tmp.close()
-
-    path = tmp.name
-
-    fid = drive_id_from_url(url)
-
-    if fid:
-        if "docs.google.com/spreadsheets" in url:
-            export_url = f"https://docs.google.com/spreadsheets/d/{fid}/export?format=xlsx"
-        else:
-            export_url = f"https://drive.google.com/uc?export=download&id={fid}"
-
-        with requests.get(export_url, stream=True, timeout=180) as r:
-            r.raise_for_status()
-
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-
-        return path
-
-    url2 = onedrive_direct(url)
-
-    with requests.get(url2, stream=True, timeout=180) as r:
-        r.raise_for_status()
-
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-    return path
 
 # ================= SIDEBAR =================
 with st.sidebar:
@@ -786,14 +646,7 @@ with st.sidebar:
     st.markdown("Branch Reconciliation Control Panel")
 
     st.divider()
-
-    mode = st.radio(
-        "Match Mode",
-        ["Exact Original", "Fast Same Result"],
-        index=0
-    )
-
-    use_fast = mode.startswith("Fast")
+    st.info("⚡ Match Mode locked to: Fast Same Result")
 
     st.markdown("### 📄 Sheet Names")
 
@@ -828,36 +681,22 @@ with st.sidebar:
 # ================= INPUT AREA =================
 st.markdown("""
 <div class="section-card status-info">
-    <h3 style="margin-top:0;">📂 Upload or Connect Source File</h3>
+    <h3 style="margin-top:0;">📂 Upload Source File</h3>
     <p class="small-muted">
-        Upload Excel file or paste Drive / Google Sheets / OneDrive / SharePoint link.
+        Upload the Excel file containing your books.
     </p>
 </div>
 """, unsafe_allow_html=True)
 
-source = st.radio(
-    "Choose input method",
-    ["Upload File", "From URL"],
-    horizontal=True
+uploaded = st.file_uploader(
+    "Upload Excel file",
+    type=["xlsx", "xls"]
 )
-
-uploaded = None
-file_url = None
-
-if source == "Upload File":
-    uploaded = st.file_uploader(
-        "Upload Excel file",
-        type=["xlsx", "xls"]
-    )
-else:
-    file_url = st.text_input(
-        "Paste share link here"
-    )
 
 run_btn = st.button(
     "🚀 Run Reconciliation",
     type="primary",
-    disabled=(uploaded is None and not file_url)
+    disabled=(uploaded is None)
 )
 
 # ================= KPI DISPLAY FUNCTION =================
@@ -877,27 +716,15 @@ def safe_len(df):
 if run_btn:
     try:
         with st.spinner("Processing reconciliation..."):
-            if file_url:
-                local_path = download_to_temp(file_url)
+            file_bytes = uploaded.read()
 
-                with open(local_path, "rb") as f:
-                    file_bytes = f.read()
-
-                try:
-                    os.unlink(local_path)
-                except Exception:
-                    pass
-            else:
-                file_bytes = uploaded.read()
-
-            matching_df, unmatching_df, out_xlsx = run_recon_cached_v2(
+            matching_df, unmatching_df, out_xlsx = run_recon_cached_v3(
                 file_bytes,
                 our_sheet,
                 branch_sheet,
                 AMOUNT_TOLERANCE_DEFAULT,
                 name_thresh,
-                use_fast,
-                _version="modern-v3"
+                _version="fast-v1"
             )
 
         st.success("Reconciliation completed successfully.")
@@ -1006,7 +833,7 @@ if run_btn:
             st.download_button(
                 "⬇ Download Complete Excel Report",
                 data=out_xlsx.getvalue(),
-                file_name=f"Branch_Recon_Output_{'FAST' if use_fast else 'ORIG'}.xlsx",
+                file_name="Branch_Recon_Output_FAST.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
