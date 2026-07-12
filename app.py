@@ -1,5 +1,5 @@
 # app.py — Modern Branch Reconciliation App
-import io, re, os
+import io, re, os, tempfile, requests
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -22,7 +22,7 @@ st.set_page_config(
 # ================= MODERN CSS =================
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght=400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
 html, body, [class*="css"] {
     font-family: 'Inter', sans-serif;
@@ -179,7 +179,7 @@ st.markdown("""
     <h1>🔗 Branch Reconciliation System</h1>
     <p>Issam Kabbani & Partners Unitech —  Reconciliation Dashboard</p>
     <div class="badge-row">
-        <span class="badge">✅ Fully Dynamic Sheet Auto-Detect</span>
+        <span class="badge">✅ Exact Matching</span>
         <span class="badge">📊 KPI Summary</span>
         <span class="badge">⬇ Excel Export</span>
     </div>
@@ -353,7 +353,129 @@ def strip_time_cols(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
+# ================= SHEET ALIAS =================
+def _casefold(s: str) -> str:
+    return s.strip().lower()
+
+def _eq(a: str, b: str) -> bool:
+    return _casefold(a) == _casefold(b)
+
+OUR_ALIASES = {"our book", "tosl", "ourbook", "our_book"}
+BR_ALIASES = {"branch book", "branch", "br", "branchbook", "branch_book"}
+
+def _find_by_alias(target, names):
+    if not target:
+        return None
+
+    t = _casefold(target)
+
+    for n in names:
+        if _eq(n, target):
+            return n
+
+    if t in OUR_ALIASES:
+        for n in names:
+            if _casefold(n) in OUR_ALIASES:
+                return n
+
+    if t in BR_ALIASES:
+        for n in names:
+            if _casefold(n) in BR_ALIASES:
+                return n
+
+    return None
+
+def _auto_pick_other(our_name, names):
+    for n in names:
+        if not _eq(n, our_name) and _casefold(n) in BR_ALIASES:
+            return n
+
+    for n in names:
+        if not _eq(n, our_name):
+            return n
+
+    return None
+
 # ================= MATCHING ENGINE =================
+def pair_exact_best(left, right, labelL, labelR, tol, name_thresh=NAME_SIM_THRESHOLD_DEFAULT):
+    ref_index = {}
+
+    for j, r in right.iterrows():
+        toks = r["AllRefs"]
+        if not isinstance(toks, set):
+            toks = set() if pd.isna(toks) else set(toks)
+
+        for tok in toks:
+            ref_index.setdefault(tok, set()).add(j)
+
+    def candidates(lrow):
+        toks = lrow["AllRefs"]
+        if not isinstance(toks, set):
+            toks = set() if pd.isna(toks) else set(toks)
+
+        cand = set()
+        for tok in toks:
+            cand |= ref_index.get(tok, set())
+
+        return list(cand) if cand else list(range(len(right)))
+
+    usedL, usedR, matched = set(), set(), []
+
+    for i, l in left.iterrows():
+        cands = candidates(l)
+
+        if not cands:
+            continue
+
+        def score(j):
+            r = right.loc[j]
+            num_ov = len(l["NumRefs"] & r["NumRefs"])
+            aln_ov = len(l["AlnumRefs"] & r["AlnumRefs"])
+            nm_ov = len(l["NameRefs"] & r["NameRefs"])
+            nm_sim = name_similarity(l["NameRefs"], r["NameRefs"])
+            amt_d = abs(float(l["Amt"]) - float(r["Amt"]))
+            d1, d2 = l["Date"], r["Date"]
+            d_d = abs((d1 - d2).days) if (pd.notna(d1) and pd.notna(d2)) else 10**9
+
+            return (-num_ov, -(aln_ov + nm_ov * 0.5), -int(nm_sim * 1000), amt_d, d_d)
+
+        cands = sorted(cands, key=score)
+
+        for j in cands:
+            if i in usedL or j in usedR:
+                continue
+
+            r = right.loc[j]
+
+            num_ov = len(l["NumRefs"] & r["NumRefs"])
+            tok_ov = len(l["AlnumRefs"] & r["AlnumRefs"])
+            nm_sim = name_similarity(l["NameRefs"], r["NameRefs"])
+
+            if not (num_ov >= 1 or tok_ov >= 1 or nm_sim >= name_thresh):
+                continue
+
+            amt_diff = abs(float(l["Amt"]) - float(r["Amt"]))
+
+            if amt_diff <= tol:
+                matched.append((l, r, round(amt_diff, ROUND_DP)))
+                usedL.add(i)
+                usedR.add(j)
+                break
+
+    match_df = pd.DataFrame([{
+        f"{labelL} Date": a["Date"],
+        f"{labelL} Voucher": a["Voucher"],
+        f"{labelL} Description": a["Description"],
+        f"{labelL} Amount": a["Amt"],
+        f"{labelR} Date": b["Date"],
+        f"{labelR} Voucher": b["Voucher"],
+        f"{labelR} Description": b["Description"],
+        f"{labelR} Amount": b["Amt"],
+        "Amount_Diff": diff
+    } for (a, b, diff) in matched])
+
+    return match_df, usedL, usedR
+
 def pair_exact_best_fast_same(left, right, labelL, labelR, tol, name_thresh=NAME_SIM_THRESHOLD_DEFAULT):
     right_amt = right["Amt"].astype(float).values
 
@@ -362,6 +484,7 @@ def pair_exact_best_fast_same(left, right, labelL, labelR, tol, name_thresh=NAME
         return list(np.nonzero(diff <= tol)[0])
 
     usedL, usedR, matched = set(), set(), []
+
     ref_index = {}
 
     for j, r in right.iterrows():
@@ -374,10 +497,12 @@ def pair_exact_best_fast_same(left, right, labelL, labelR, tol, name_thresh=NAME
 
     for i, l in left.iterrows():
         cands = set(candidates_amount(l["Amt"]))
+
         toks = l["AllRefs"] if isinstance(l["AllRefs"], set) else set()
 
         if toks:
             ref_cands = set()
+
             for tok in toks:
                 ref_cands |= ref_index.get(tok, set())
 
@@ -408,6 +533,7 @@ def pair_exact_best_fast_same(left, right, labelL, labelR, tol, name_thresh=NAME
                 continue
 
             r = right.loc[j]
+
             num_ov = len(l["NumRefs"] & r["NumRefs"])
             tok_ov = len(l["AlnumRefs"] & r["AlnumRefs"])
             nm_sim = name_similarity(l["NameRefs"], r["NameRefs"])
@@ -440,24 +566,55 @@ def pair_exact_best_fast_same(left, right, labelL, labelR, tol, name_thresh=NAME
 # ================= CORE RECON =================
 def run_recon_core(
     xls_bytes,
-    our_name,
-    branch_name,
+    our_sheet_name,
+    branch_sheet_name,
     amount_tol,
-    name_sim_thresh
+    name_sim_thresh,
+    use_fast=False
 ):
+    xls = pd.ExcelFile(xls_bytes)
+    names = xls.sheet_names
+
+    our_name = (
+        _find_by_alias(our_sheet_name, names)
+        or next((s for s in names if _eq(s, our_sheet_name)), None)
+    )
+
+    if not our_name:
+        raise ValueError(f"Our book sheet '{our_sheet_name}' not found. Found: {names}")
+
+    if branch_sheet_name:
+        branch_name = (
+            _find_by_alias(branch_sheet_name, names)
+            or next((s for s in names if _eq(s, branch_sheet_name)), None)
+        )
+
+        if not branch_name:
+            raise ValueError(
+                f"Branch book sheet '{branch_sheet_name}' not found. Found: {names}"
+            )
+    else:
+        branch_name = _auto_pick_other(our_name, names)
+
+        if not branch_name:
+            raise ValueError("Could not determine Branch sheet. Please type it explicitly.")
+
     OUR = prep_sheet(pd.read_excel(xls_bytes, sheet_name=our_name))
     BR = prep_sheet(pd.read_excel(xls_bytes, sheet_name=branch_name))
 
     OUR_DR, OUR_CR = split_sides(OUR, "OUR")
     BR_DR, BR_CR = split_sides(BR, "BR")
 
-    label_our_dr = f"{our_name} DR"
-    label_our_cr = f"{our_name} CR"
-    label_br_dr = f"{branch_name} DR"
-    label_br_cr = f"{branch_name} CR"
+    label_our_dr = "Our book DR"
+    label_our_cr = "Our book CR"
+    label_br_dr = "Branch book DR"
+    label_br_cr = "Branch book CR"
 
-    matcher = pair_exact_best_fast_same
+    matcher = pair_exact_best_fast_same if use_fast else pair_exact_best
 
+    # Matching rule:
+    # Our Debit should match Branch Credit
+    # Our Credit should match Branch Debit
     m1, usedL1, usedR1 = matcher(
         OUR_DR,
         BR_CR,
@@ -482,6 +639,7 @@ def run_recon_core(
         else pd.DataFrame()
     )
 
+    # Unmatching only excludes exact matches. No partial matching is used.
     un_our = pd.concat([
         OUR_DR.loc[[i for i in OUR_DR.index if i not in usedL1]],
         OUR_CR.loc[[i for i in OUR_CR.index if i not in usedL2]],
@@ -492,8 +650,8 @@ def run_recon_core(
         BR_DR.loc[[i for i in BR_DR.index if i not in usedR2]],
     ], ignore_index=True)
 
-    un_our["Which"] = our_name
-    un_br["Which"] = branch_name
+    un_our["Which"] = "Our book"
+    un_br["Which"] = "Branch book"
 
     unmatching_df = pd.concat([
         un_our[["Which", "Date", "Voucher", "Description", "Debit", "Credit", "Amt"]],
@@ -549,13 +707,14 @@ def run_recon_core(
     return matching_df, unmatching_df, out
 
 @st.cache_data(show_spinner=False)
-def run_recon_cached_v4(
+def run_recon_cached_v2(
     file_bytes: bytes,
     our_sheet_name,
     branch_sheet_name,
     amount_tol,
     name_sim_thresh,
-    _version: str = "fast-v2"
+    use_fast,
+    _version: str = "modern-v3"
 ):
     buf = io.BytesIO(file_bytes)
     return run_recon_core(
@@ -563,8 +722,63 @@ def run_recon_cached_v4(
         our_sheet_name,
         branch_sheet_name,
         amount_tol,
-        name_sim_thresh
+        name_sim_thresh,
+        use_fast
     )
+
+# ================= URL HELPERS =================
+def drive_id_from_url(url: str):
+    m = re.search(r"/(?:file|spreadsheets)/d/([A-Za-z0-9_-]+)", url)
+
+    if m:
+        return m.group(1)
+
+    m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", url)
+
+    return m.group(1) if m else None
+
+def onedrive_direct(url: str):
+    if "1drv.ms" in url or "sharepoint.com" in url:
+        if "download=1" not in url:
+            url += ("&" if "?" in url else "?") + "download=1"
+
+    return url
+
+def download_to_temp(url: str) -> str:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    tmp.close()
+
+    path = tmp.name
+
+    fid = drive_id_from_url(url)
+
+    if fid:
+        if "docs.google.com/spreadsheets" in url:
+            export_url = f"https://docs.google.com/spreadsheets/d/{fid}/export?format=xlsx"
+        else:
+            export_url = f"https://drive.google.com/uc?export=download&id={fid}"
+
+        with requests.get(export_url, stream=True, timeout=180) as r:
+            r.raise_for_status()
+
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+        return path
+
+    url2 = onedrive_direct(url)
+
+    with requests.get(url2, stream=True, timeout=180) as r:
+        r.raise_for_status()
+
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+    return path
 
 # ================= SIDEBAR =================
 with st.sidebar:
@@ -572,9 +786,29 @@ with st.sidebar:
     st.markdown("Branch Reconciliation Control Panel")
 
     st.divider()
-    st.info("⚡ Match Mode locked to: Fast Same Result")
+
+    mode = st.radio(
+        "Match Mode",
+        ["Exact Original", "Fast Same Result"],
+        index=0
+    )
+
+    use_fast = mode.startswith("Fast")
+
+    st.markdown("### 📄 Sheet Names")
+
+    our_sheet = st.text_input(
+        "Our Book Sheet",
+        value="Our book"
+    )
+
+    branch_sheet = st.text_input(
+        "Branch Book Sheet",
+        value="Branch book"
+    )
 
     st.markdown("### 🎯 Matching Rules")
+
     st.info("Amount tolerance fixed at ± 5 SAR")
 
     name_thresh = st.slider(
@@ -594,48 +828,37 @@ with st.sidebar:
 # ================= INPUT AREA =================
 st.markdown("""
 <div class="section-card status-info">
-    <h3 style="margin-top:0;">📂 Upload Source File</h3>
+    <h3 style="margin-top:0;">📂 Upload or Connect Source File</h3>
     <p class="small-muted">
-        Upload any Excel file. The app automatically grabs whatever the first two sheets are called and processes them.
+        Upload Excel file or paste Drive / Google Sheets / OneDrive / SharePoint link.
     </p>
 </div>
 """, unsafe_allow_html=True)
 
-uploaded = st.file_uploader(
-    "Upload Excel file",
-    type=["xlsx", "xls"]
+source = st.radio(
+    "Choose input method",
+    ["Upload File", "From URL"],
+    horizontal=True
 )
 
-# Initialize variables to prevent execution block state errors
-run_btn = False
-our_sheet = ""
-branch_sheet = ""
+uploaded = None
+file_url = None
 
-if uploaded is not None:
-    try:
-        xls_file = pd.ExcelFile(uploaded)
-        sheet_options = xls_file.sheet_names
-        
-        if len(sheet_options) < 2:
-            st.error(f"The uploaded Excel file must have at least 2 sheets. Found sheets: {sheet_options}")
-        else:
-            # Auto-lock onto whatever sheet 1 and sheet 2 are named in their Excel file
-            our_sheet = sheet_options[0]
-            branch_sheet = sheet_options[1]
-            
-            st.markdown(f"""
-            <div class="section-card status-success">
-                <h4 style="margin-top:0; color:#16a34a;">✨ Automatic Sheets Discovered</h4>
-                <p class="small-muted">Ready to match <b>{our_sheet}</b> against <b>{branch_sheet}</b></p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            run_btn = st.button(
-                "🚀 Run Reconciliation",
-                type="primary"
-            )
-    except Exception as e:
-        st.error(f"Error reading Excel sheets: {str(e)}")
+if source == "Upload File":
+    uploaded = st.file_uploader(
+        "Upload Excel file",
+        type=["xlsx", "xls"]
+    )
+else:
+    file_url = st.text_input(
+        "Paste share link here"
+    )
+
+run_btn = st.button(
+    "🚀 Run Reconciliation",
+    type="primary",
+    disabled=(uploaded is None and not file_url)
+)
 
 # ================= KPI DISPLAY FUNCTION =================
 def kpi_card(title, value, note, status_class="status-info"):
@@ -651,20 +874,30 @@ def safe_len(df):
     return 0 if df is None or df.empty else len(df)
 
 # ================= RUN APP =================
-# If file is present and the run button was pushed, execute immediately
-if uploaded is not None and run_btn:
+if run_btn:
     try:
         with st.spinner("Processing reconciliation..."):
-            uploaded.seek(0)
-            file_bytes = uploaded.read()
+            if file_url:
+                local_path = download_to_temp(file_url)
 
-            matching_df, unmatching_df, out_xlsx = run_recon_cached_v4(
+                with open(local_path, "rb") as f:
+                    file_bytes = f.read()
+
+                try:
+                    os.unlink(local_path)
+                except Exception:
+                    pass
+            else:
+                file_bytes = uploaded.read()
+
+            matching_df, unmatching_df, out_xlsx = run_recon_cached_v2(
                 file_bytes,
                 our_sheet,
                 branch_sheet,
                 AMOUNT_TOLERANCE_DEFAULT,
                 name_thresh,
-                _version="fast-v2"
+                use_fast,
+                _version="modern-v3"
             )
 
         st.success("Reconciliation completed successfully.")
@@ -679,7 +912,7 @@ if uploaded is not None and run_btn:
             else 0
         )
 
-        st.markdown(f"## 📊 Reconciliation Summary ({our_sheet} vs {branch_sheet})")
+        st.markdown("## 📊 Reconciliation Summary")
 
         c1, c2, c3, c4 = st.columns(4)
 
@@ -698,10 +931,10 @@ if uploaded is not None and run_btn:
         st.markdown("---")
 
         tab_summary, tab_match, tab_unmatch, tab_export = st.tabs([
-            "📊 Summary Overview",
-            f"✅ Matched Transactions",
-            f"❌ Unmatched Review",
-            "⬇ Export Data"
+            "📊 Summary",
+            "✅ Matching",
+            "❌ Unmatching",
+            "⬇ Export"
         ])
 
         with tab_summary:
@@ -743,7 +976,8 @@ if uploaded is not None and run_btn:
                 st.info("No data available for chart.")
 
         with tab_match:
-            st.markdown(f"### ✅ Exact Matches Found")
+            st.markdown("### ✅ Exact Matching Transactions")
+
             st.dataframe(
                 matching_df if not matching_df.empty else pd.DataFrame({"Info": ["No matches found"]}),
                 use_container_width=True,
@@ -751,7 +985,8 @@ if uploaded is not None and run_btn:
             )
 
         with tab_unmatch:
-            st.markdown(f"### ❌ Unmatched Item Standouts")
+            st.markdown("### ❌ Unmatched Transactions")
+
             st.dataframe(
                 unmatching_df if not unmatching_df.empty else pd.DataFrame({"Info": ["No unmatching transactions"]}),
                 use_container_width=True,
@@ -763,7 +998,7 @@ if uploaded is not None and run_btn:
             <div class="section-card status-success">
                 <h3 style="margin-top:0;">⬇ Export Reconciliation Report</h3>
                 <p class="small-muted">
-                    Download complete Excel output report using your exact custom sheet headers.
+                    Download complete Excel output with Matching and Unmatching sheets.
                 </p>
             </div>
             """, unsafe_allow_html=True)
@@ -771,20 +1006,17 @@ if uploaded is not None and run_btn:
             st.download_button(
                 "⬇ Download Complete Excel Report",
                 data=out_xlsx.getvalue(),
-                file_name=f"Recon_Output_{our_sheet}_vs_{branch_sheet}.xlsx",
+                file_name=f"Branch_Recon_Output_{'FAST' if use_fast else 'ORIG'}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
     except Exception as e:
         st.error(str(e))
 
-elif uploaded is None:
-    st.info("Please upload an Excel workbook above to begin.")
-
 # ================= FOOTER =================
 st.markdown("""
 <div class="footer">
-    <strong>Branch Reconciliation v3.3</strong><br>
+    <strong>Branch Reconciliation v3.1</strong><br>
     Created by: Jaseer Pykarathodi — Treasury Officer<br>
     Issam Kabbani & Partners Unitech
 </div>
