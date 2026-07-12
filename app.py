@@ -596,7 +596,7 @@ st.markdown("""
 <div class="section-card status-info">
     <h3 style="margin-top:0;">📂 Upload Source File</h3>
     <p class="small-muted">
-        Upload any Excel file. The app automatically reconciles the first two sheets it detects.
+        Upload any Excel file. The app automatically grabs whatever the first two sheets are called and processes them.
     </p>
 </div>
 """, unsafe_allow_html=True)
@@ -606,6 +606,11 @@ uploaded = st.file_uploader(
     type=["xlsx", "xls"]
 )
 
+# Initialize variables to prevent execution block state errors
+run_btn = False
+our_sheet = ""
+branch_sheet = ""
+
 if uploaded is not None:
     try:
         xls_file = pd.ExcelFile(uploaded)
@@ -613,9 +618,8 @@ if uploaded is not None:
         
         if len(sheet_options) < 2:
             st.error(f"The uploaded Excel file must have at least 2 sheets. Found sheets: {sheet_options}")
-            run_btn = False
         else:
-            # Zero-intervention: Automatically lock onto sheet 1 and sheet 2
+            # Auto-lock onto whatever sheet 1 and sheet 2 are named in their Excel file
             our_sheet = sheet_options[0]
             branch_sheet = sheet_options[1]
             
@@ -632,10 +636,6 @@ if uploaded is not None:
             )
     except Exception as e:
         st.error(f"Error reading Excel sheets: {str(e)}")
-        run_btn = False
-else:
-    st.info("Please upload an Excel workbook above to begin.")
-    run_btn = False
 
 # ================= KPI DISPLAY FUNCTION =================
 def kpi_card(title, value, note, status_class="status-info"):
@@ -651,7 +651,8 @@ def safe_len(df):
     return 0 if df is None or df.empty else len(df)
 
 # ================= RUN APP =================
-if run_btn and uploaded is not None:
+# If file is present and the run button was pushed, execute immediately
+if uploaded is not None and run_btn:
     try:
         with st.spinner("Processing reconciliation..."):
             uploaded.seek(0)
@@ -777,10 +778,13 @@ if run_btn and uploaded is not None:
     except Exception as e:
         st.error(str(e))
 
+elif uploaded is None:
+    st.info("Please upload an Excel workbook above to begin.")
+
 # ================= FOOTER =================
 st.markdown("""
 <div class="footer">
-    <strong>Branch Reconciliation v3.2</strong><br>
+    <strong>Branch Reconciliation v3.3</strong><br>
     Created by: Jaseer Pykarathodi — Treasury Officer<br>
     Issam Kabbani & Partners Unitech
 </div>
