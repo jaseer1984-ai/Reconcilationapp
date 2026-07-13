@@ -1,4 +1,4 @@
-# app.py — Optimized Modern Branch Reconciliation App
+# app.py — Modern Branch Reconciliation App
 import io, re, os, tempfile, requests
 import pandas as pd
 import numpy as np
@@ -115,6 +115,22 @@ html, body, [class*="css"] {
     margin-bottom: 18px;
 }
 
+.status-success {
+    border-left: 7px solid #10b981;
+}
+
+.status-warning {
+    border-left: 7px solid #f59e0b;
+}
+
+.status-danger {
+    border-left: 7px solid #ef4444;
+}
+
+.status-info {
+    border-left: 7px solid #3b82f6;
+}
+
 div.stButton > button:first-child {
     border-radius: 16px;
     border: none;
@@ -153,6 +169,7 @@ hr {
     border: none;
     border-top: 1px solid #e2e8f0;
 }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -251,16 +268,21 @@ def extract_refs_all(voucher: str, description: str):
 
     return num_set, alnum_set, name_set
 
-def name_similarity_fast(a_names: set, b_names: set, a_str: str, b_str: str) -> float:
+def name_similarity(a_names: set, b_names: set) -> float:
     if not a_names and not b_names:
         return 0.0
 
-    union_len = len(a_names | b_names)
-    jacc = len(a_names & b_names) / union_len if union_len > 0 else 0.0
-    if jacc == 1.0:
-        return 1.0
+    jacc = (
+        len(a_names & b_names) / len(a_names | b_names)
+        if (a_names or b_names)
+        else 0.0
+    )
+
+    a_str = normalize_spaces(" ".join(sorted(a_names)))
+    b_str = normalize_spaces(" ".join(sorted(b_names)))
 
     seq = SequenceMatcher(None, a_str, b_str).ratio() if a_str and b_str else 0.0
+
     return max(jacc, seq)
 
 def prep_sheet(df):
@@ -271,7 +293,9 @@ def prep_sheet(df):
             if n.lower() in cols:
                 return cols[n.lower()]
         if required:
-            raise ValueError(f"Missing required column among {names}. Found: {list(df.columns)}")
+            raise ValueError(
+                f"Missing required column among {names}. Found: {list(df.columns)}"
+            )
         return None
 
     cDate = pick("date")
@@ -295,10 +319,10 @@ def prep_sheet(df):
     out["NumRefs"] = refs.map(lambda t: t[0])
     out["AlnumRefs"] = refs.map(lambda t: t[1])
     out["NameRefs"] = refs.map(lambda t: t[2])
-    out["AllRefs"] = out.apply(lambda r: set().union(r["NumRefs"], r["AlnumRefs"], r["NameRefs"]), axis=1)
-    
-    # Pre-compute string sequences for sequence matcher to avoid repeating inside nested loops
-    out["NameStr"] = out["NameRefs"].map(lambda s: normalize_spaces(" ".join(sorted(s))))
+    out["AllRefs"] = out.apply(
+        lambda r: set().union(r["NumRefs"], r["AlnumRefs"], r["NameRefs"]),
+        axis=1
+    )
 
     return out
 
@@ -320,10 +344,13 @@ def split_sides(df, tag):
 def strip_time_cols(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
+
     out = df.copy()
+
     for c in out.columns:
         if "date" in c.lower():
             out[c] = pd.to_datetime(out[c], errors="coerce").dt.date
+
     return out
 
 # ================= SHEET ALIAS =================
@@ -339,36 +366,45 @@ BR_ALIASES = {"branch book", "branch", "br", "branchbook", "branch_book"}
 def _find_by_alias(target, names):
     if not target:
         return None
+
     t = _casefold(target)
+
     for n in names:
         if _eq(n, target):
             return n
+
     if t in OUR_ALIASES:
         for n in names:
             if _casefold(n) in OUR_ALIASES:
                 return n
+
     if t in BR_ALIASES:
         for n in names:
             if _casefold(n) in BR_ALIASES:
                 return n
+
     return None
 
 def _auto_pick_other(our_name, names):
     for n in names:
         if not _eq(n, our_name) and _casefold(n) in BR_ALIASES:
             return n
+
     for n in names:
         if not _eq(n, our_name):
             return n
+
     return None
 
-# ================= MATCHING ENGINE (OPTIMIZED) =================
+# ================= MATCHING ENGINE =================
 def pair_exact_best(left, right, labelL, labelR, tol, name_thresh=NAME_SIM_THRESHOLD_DEFAULT):
     ref_index = {}
+
     for j, r in right.iterrows():
         toks = r["AllRefs"]
         if not isinstance(toks, set):
             toks = set() if pd.isna(toks) else set(toks)
+
         for tok in toks:
             ref_index.setdefault(tok, set()).add(j)
 
@@ -376,48 +412,55 @@ def pair_exact_best(left, right, labelL, labelR, tol, name_thresh=NAME_SIM_THRES
         toks = lrow["AllRefs"]
         if not isinstance(toks, set):
             toks = set() if pd.isna(toks) else set(toks)
+
         cand = set()
         for tok in toks:
             cand |= ref_index.get(tok, set())
+
         return list(cand) if cand else list(range(len(right)))
 
     usedL, usedR, matched = set(), set(), []
 
     for i, l in left.iterrows():
         cands = candidates(l)
+
         if not cands:
             continue
 
-        scored_candidates = []
-        for j in cands:
-            if j in usedR:
-                continue
+        def score(j):
             r = right.loc[j]
             num_ov = len(l["NumRefs"] & r["NumRefs"])
             aln_ov = len(l["AlnumRefs"] & r["AlnumRefs"])
             nm_ov = len(l["NameRefs"] & r["NameRefs"])
-            nm_sim = name_similarity_fast(l["NameRefs"], r["NameRefs"], l["NameStr"], r["NameStr"])
-            
-            if not (num_ov >= 1 or nm_ov >= 1 or nm_sim >= name_thresh):
+            nm_sim = name_similarity(l["NameRefs"], r["NameRefs"])
+            amt_d = abs(float(l["Amt"]) - float(r["Amt"]))
+            d1, d2 = l["Date"], r["Date"]
+            d_d = abs((d1 - d2).days) if (pd.notna(d1) and pd.notna(d2)) else 10**9
+
+            return (-num_ov, -(aln_ov + nm_ov * 0.5), -int(nm_sim * 1000), amt_d, d_d)
+
+        cands = sorted(cands, key=score)
+
+        for j in cands:
+            if i in usedL or j in usedR:
+                continue
+
+            r = right.loc[j]
+
+            num_ov = len(l["NumRefs"] & r["NumRefs"])
+            tok_ov = len(l["AlnumRefs"] & r["AlnumRefs"])
+            nm_sim = name_similarity(l["NameRefs"], r["NameRefs"])
+
+            if not (num_ov >= 1 or tok_ov >= 1 or nm_sim >= name_thresh):
                 continue
 
             amt_diff = abs(float(l["Amt"]) - float(r["Amt"]))
-            if amt_diff <= tol:
-                d1, d2 = l["Date"], r["Date"]
-                d_d = abs((d1 - d2).days) if (pd.notna(d1) and pd.notna(d2)) else 10**9
-                
-                # Metrics for sorting: higher overlap first, closer amount/date difference
-                sort_key = (-num_ov, -(aln_ov + nm_ov * 0.5), -int(nm_sim * 1000), amt_diff, d_d)
-                scored_candidates.append((sort_key, j, r, amt_diff))
 
-        if scored_candidates:
-            scored_candidates.sort(key=lambda x: x[0])
-            for _, j, r, amt_diff in scored_candidates:
-                if j not in usedR:
-                    matched.append((l, r, round(amt_diff, ROUND_DP)))
-                    usedL.add(i)
-                    usedR.add(j)
-                    break
+            if amt_diff <= tol:
+                matched.append((l, r, round(amt_diff, ROUND_DP)))
+                usedL.add(i)
+                usedR.add(j)
+                break
 
     match_df = pd.DataFrame([{
         f"{labelL} Date": a["Date"],
@@ -438,60 +481,73 @@ def pair_exact_best_fast_same(left, right, labelL, labelR, tol, name_thresh=NAME
 
     def candidates_amount(l_amt):
         diff = np.abs(right_amt - float(l_amt))
-        return np.nonzero(diff <= tol)[0]
+        return list(np.nonzero(diff <= tol)[0])
 
     usedL, usedR, matched = set(), set(), []
+
     ref_index = {}
+
     for j, r in right.iterrows():
         toks = r["AllRefs"]
         if not isinstance(toks, set):
             toks = set() if pd.isna(toks) else set(toks)
+
         for tok in toks:
             ref_index.setdefault(tok, set()).add(j)
 
     for i, l in left.iterrows():
-        amt_cands = set(candidates_amount(l["Amt"]))
+        cands = set(candidates_amount(l["Amt"]))
+
         toks = l["AllRefs"] if isinstance(l["AllRefs"], set) else set()
 
         if toks:
             ref_cands = set()
+
             for tok in toks:
                 ref_cands |= ref_index.get(tok, set())
-            cands = amt_cands & ref_cands if ref_cands else amt_cands
-        else:
-            cands = amt_cands
+
+            if ref_cands:
+                cands = cands & ref_cands if cands else ref_cands
 
         if not cands:
             continue
 
-        scored_candidates = []
-        for j in cands:
-            if j in usedR:
-                continue
+        cands = list(cands)
+
+        def score(j):
             r = right.loc[j]
             num_ov = len(l["NumRefs"] & r["NumRefs"])
             aln_ov = len(l["AlnumRefs"] & r["AlnumRefs"])
             nm_ov = len(l["NameRefs"] & r["NameRefs"])
-            nm_sim = name_similarity_fast(l["NameRefs"], r["NameRefs"], l["NameStr"], r["NameStr"])
+            nm_sim = name_similarity(l["NameRefs"], r["NameRefs"])
+            amt_d = abs(float(l["Amt"]) - float(r["Amt"]))
+            d1, d2 = l["Date"], r["Date"]
+            d_d = abs((d1 - d2).days) if (pd.notna(d1) and pd.notna(d2)) else 10**9
 
-            if not (num_ov >= 1 or aln_ov >= 1 or nm_sim >= name_thresh):
+            return (-num_ov, -(aln_ov + nm_ov * 0.5), -int(nm_sim * 1000), amt_d, d_d)
+
+        cands = sorted(cands, key=score)
+
+        for j in cands:
+            if i in usedL or j in usedR:
+                continue
+
+            r = right.loc[j]
+
+            num_ov = len(l["NumRefs"] & r["NumRefs"])
+            tok_ov = len(l["AlnumRefs"] & r["AlnumRefs"])
+            nm_sim = name_similarity(l["NameRefs"], r["NameRefs"])
+
+            if not (num_ov >= 1 or tok_ov >= 1 or nm_sim >= name_thresh):
                 continue
 
             amt_diff = abs(float(l["Amt"]) - float(r["Amt"]))
-            if amt_diff <= tol:
-                d1, d2 = l["Date"], r["Date"]
-                d_d = abs((d1 - d2).days) if (pd.notna(d1) and pd.notna(d2)) else 10**9
-                sort_key = (-num_ov, -(aln_ov + nm_ov * 0.5), -int(nm_sim * 1000), amt_diff, d_d)
-                scored_candidates.append((sort_key, j, r, amt_diff))
 
-        if scored_candidates:
-            scored_candidates.sort(key=lambda x: x[0])
-            for _, j, r, amt_diff in scored_candidates:
-                if j not in usedR:
-                    matched.append((l, r, round(amt_diff, ROUND_DP)))
-                    usedL.add(i)
-                    usedR.add(j)
-                    break
+            if amt_diff <= tol:
+                matched.append((l, r, round(amt_diff, ROUND_DP)))
+                usedL.add(i)
+                usedR.add(j)
+                break
 
     match_df = pd.DataFrame([{
         f"{labelL} Date": a["Date"],
@@ -508,20 +564,38 @@ def pair_exact_best_fast_same(left, right, labelL, labelR, tol, name_thresh=NAME
     return match_df, usedL, usedR
 
 # ================= CORE RECON =================
-def run_recon_core(xls_bytes, our_sheet_name, branch_sheet_name, amount_tol, name_sim_thresh, use_fast=False):
+def run_recon_core(
+    xls_bytes,
+    our_sheet_name,
+    branch_sheet_name,
+    amount_tol,
+    name_sim_thresh,
+    use_fast=False
+):
     xls = pd.ExcelFile(xls_bytes)
     names = xls.sheet_names
 
-    our_name = _find_by_alias(our_sheet_name, names) or next((s for s in names if _eq(s, our_sheet_name)), None)
+    our_name = (
+        _find_by_alias(our_sheet_name, names)
+        or next((s for s in names if _eq(s, our_sheet_name)), None)
+    )
+
     if not our_name:
         raise ValueError(f"Our book sheet '{our_sheet_name}' not found. Found: {names}")
 
     if branch_sheet_name:
-        branch_name = _find_by_alias(branch_sheet_name, names) or next((s for s in names if _eq(s, branch_sheet_name)), None)
+        branch_name = (
+            _find_by_alias(branch_sheet_name, names)
+            or next((s for s in names if _eq(s, branch_sheet_name)), None)
+        )
+
         if not branch_name:
-            raise ValueError(f"Branch book sheet '{branch_sheet_name}' not found. Found: {names}")
+            raise ValueError(
+                f"Branch book sheet '{branch_sheet_name}' not found. Found: {names}"
+            )
     else:
         branch_name = _auto_pick_other(our_name, names)
+
         if not branch_name:
             raise ValueError("Could not determine Branch sheet. Please type it explicitly.")
 
@@ -531,16 +605,41 @@ def run_recon_core(xls_bytes, our_sheet_name, branch_sheet_name, amount_tol, nam
     OUR_DR, OUR_CR = split_sides(OUR, "OUR")
     BR_DR, BR_CR = split_sides(BR, "BR")
 
-    label_our_dr, label_our_cr = "Our book DR", "Our book CR"
-    label_br_dr, label_br_cr = "Branch book DR", "Branch book CR"
+    label_our_dr = "Our book DR"
+    label_our_cr = "Our book CR"
+    label_br_dr = "Branch book DR"
+    label_br_cr = "Branch book CR"
 
     matcher = pair_exact_best_fast_same if use_fast else pair_exact_best
 
-    m1, usedL1, usedR1 = matcher(OUR_DR, BR_CR, label_our_dr, label_br_cr, amount_tol, name_sim_thresh)
-    m2, usedL2, usedR2 = matcher(OUR_CR, BR_DR, label_our_cr, label_br_dr, amount_tol, name_sim_thresh)
+    # Matching rule:
+    # Our Debit should match Branch Credit
+    # Our Credit should match Branch Debit
+    m1, usedL1, usedR1 = matcher(
+        OUR_DR,
+        BR_CR,
+        label_our_dr,
+        label_br_cr,
+        amount_tol,
+        name_sim_thresh
+    )
 
-    matching_df = pd.concat([m1, m2], ignore_index=True) if (not m1.empty or not m2.empty) else pd.DataFrame()
+    m2, usedL2, usedR2 = matcher(
+        OUR_CR,
+        BR_DR,
+        label_our_cr,
+        label_br_dr,
+        amount_tol,
+        name_sim_thresh
+    )
 
+    matching_df = (
+        pd.concat([m1, m2], ignore_index=True)
+        if (not m1.empty or not m2.empty)
+        else pd.DataFrame()
+    )
+
+    # Unmatching only excludes exact matches. No partial matching is used.
     un_our = pd.concat([
         OUR_DR.loc[[i for i in OUR_DR.index if i not in usedL1]],
         OUR_CR.loc[[i for i in OUR_CR.index if i not in usedL2]],
@@ -551,7 +650,8 @@ def run_recon_core(xls_bytes, our_sheet_name, branch_sheet_name, amount_tol, nam
         BR_DR.loc[[i for i in BR_DR.index if i not in usedR2]],
     ], ignore_index=True)
 
-    un_our["Which"], un_br["Which"] = "Our book", "Branch book"
+    un_our["Which"] = "Our book"
+    un_br["Which"] = "Branch book"
 
     unmatching_df = pd.concat([
         un_our[["Which", "Date", "Voucher", "Description", "Debit", "Credit", "Amt"]],
@@ -562,11 +662,24 @@ def run_recon_core(xls_bytes, our_sheet_name, branch_sheet_name, amount_tol, nam
     unmatching_df = strip_time_cols(unmatching_df)
 
     out = io.BytesIO()
+
     with pd.ExcelWriter(out, engine="xlsxwriter") as w:
         workbook = w.book
-        header_format = workbook.add_format({"bold": True, "bg_color": "#1E3A8A", "font_color": "white", "border": 1})
-        money_format = workbook.add_format({"num_format": "#,##0.00"})
-        date_format = workbook.add_format({"num_format": "dd-mm-yyyy"})
+
+        header_format = workbook.add_format({
+            "bold": True,
+            "bg_color": "#1E3A8A",
+            "font_color": "white",
+            "border": 1
+        })
+
+        money_format = workbook.add_format({
+            "num_format": "#,##0.00"
+        })
+
+        date_format = workbook.add_format({
+            "num_format": "dd-mm-yyyy"
+        })
 
         sheets = {
             "Matching": matching_df if not matching_df.empty else pd.DataFrame({"Info": ["No matches found"]}),
@@ -576,9 +689,11 @@ def run_recon_core(xls_bytes, our_sheet_name, branch_sheet_name, amount_tol, nam
         for sheet_name, data in sheets.items():
             data.to_excel(w, sheet_name=sheet_name, index=False)
             ws = w.sheets[sheet_name]
+
             for col_num, value in enumerate(data.columns.values):
                 ws.write(0, col_num, value, header_format)
                 ws.set_column(col_num, col_num, 18)
+
             for idx, col in enumerate(data.columns):
                 if "amount" in col.lower() or "debit" in col.lower() or "credit" in col.lower() or "diff" in col.lower() or col == "Amt":
                     ws.set_column(idx, idx, 16, money_format)
@@ -588,67 +703,122 @@ def run_recon_core(xls_bytes, our_sheet_name, branch_sheet_name, amount_tol, nam
                     ws.set_column(idx, idx, 45)
 
     out.seek(0)
+
     return matching_df, unmatching_df, out
 
 @st.cache_data(show_spinner=False)
-def run_recon_cached_v2(file_bytes: bytes, our_sheet_name, branch_sheet_name, amount_tol, name_sim_thresh, use_fast, _version: str = "modern-v3"):
+def run_recon_cached_v2(
+    file_bytes: bytes,
+    our_sheet_name,
+    branch_sheet_name,
+    amount_tol,
+    name_sim_thresh,
+    use_fast,
+    _version: str = "modern-v3"
+):
     buf = io.BytesIO(file_bytes)
-    return run_recon_core(buf, our_sheet_name, branch_sheet_name, amount_tol, name_sim_thresh, use_fast)
+    return run_recon_core(
+        buf,
+        our_sheet_name,
+        branch_sheet_name,
+        amount_tol,
+        name_sim_thresh,
+        use_fast
+    )
 
 # ================= URL HELPERS =================
 def drive_id_from_url(url: str):
     m = re.search(r"/(?:file|spreadsheets)/d/([A-Za-z0-9_-]+)", url)
-    if m: return m.group(1)
+
+    if m:
+        return m.group(1)
+
     m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", url)
+
     return m.group(1) if m else None
 
 def onedrive_direct(url: str):
     if "1drv.ms" in url or "sharepoint.com" in url:
         if "download=1" not in url:
             url += ("&" if "?" in url else "?") + "download=1"
+
     return url
 
 def download_to_temp(url: str) -> str:
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
     tmp.close()
+
     path = tmp.name
+
     fid = drive_id_from_url(url)
+
     if fid:
         if "docs.google.com/spreadsheets" in url:
             export_url = f"https://docs.google.com/spreadsheets/d/{fid}/export?format=xlsx"
         else:
             export_url = f"https://drive.google.com/uc?export=download&id={fid}"
+
         with requests.get(export_url, stream=True, timeout=180) as r:
             r.raise_for_status()
+
             with open(path, "wb") as f:
                 for chunk in r.iter_content(1024 * 1024):
-                    if chunk: f.write(chunk)
+                    if chunk:
+                        f.write(chunk)
+
         return path
 
     url2 = onedrive_direct(url)
+
     with requests.get(url2, stream=True, timeout=180) as r:
         r.raise_for_status()
+
         with open(path, "wb") as f:
             for chunk in r.iter_content(1024 * 1024):
-                if chunk: f.write(chunk)
+                if chunk:
+                    f.write(chunk)
+
     return path
 
 # ================= SIDEBAR =================
 with st.sidebar:
     st.markdown("## ⚙️ Settings")
     st.markdown("Branch Reconciliation Control Panel")
+
     st.divider()
 
-    mode = st.radio("Match Mode", ["Fast Same Result", "Exact Original"], index=0)
+    mode = st.radio(
+        "Match Mode",
+        ["Exact Original", "Fast Same Result"],
+        index=0
+    )
+
     use_fast = mode.startswith("Fast")
 
     st.markdown("### 📄 Sheet Names")
-    our_sheet = st.text_input("Our Book Sheet", value="Our book")
-    branch_sheet = st.text_input("Branch Book Sheet", value="Branch book")
+
+    our_sheet = st.text_input(
+        "Our Book Sheet",
+        value="Our book"
+    )
+
+    branch_sheet = st.text_input(
+        "Branch Book Sheet",
+        value="Branch book"
+    )
 
     st.markdown("### 🎯 Matching Rules")
+
     st.info("Amount tolerance fixed at ± 5 SAR")
-    name_thresh = st.slider("Name Similarity Threshold", 0.0, 1.0, float(NAME_SIM_THRESHOLD_DEFAULT), 0.05)
+
+    name_thresh = st.slider(
+        "Name Similarity Threshold",
+        0.0,
+        1.0,
+        float(NAME_SIM_THRESHOLD_DEFAULT),
+        0.05
+    )
+
     st.divider()
 
     if st.button("♻️ Clear Cache"):
@@ -659,19 +829,36 @@ with st.sidebar:
 st.markdown("""
 <div class="section-card status-info">
     <h3 style="margin-top:0;">📂 Upload or Connect Source File</h3>
-    <p class="small-muted">Upload Excel file or paste Drive / Google Sheets / OneDrive / SharePoint link.</p>
+    <p class="small-muted">
+        Upload Excel file or paste Drive / Google Sheets / OneDrive / SharePoint link.
+    </p>
 </div>
 """, unsafe_allow_html=True)
 
-source = st.radio("Choose input method", ["Upload File", "From URL"], horizontal=True)
-uploaded, file_url = None, None
+source = st.radio(
+    "Choose input method",
+    ["Upload File", "From URL"],
+    horizontal=True
+)
+
+uploaded = None
+file_url = None
 
 if source == "Upload File":
-    uploaded = st.file_uploader("Upload Excel file", type=["xlsx", "xls"])
+    uploaded = st.file_uploader(
+        "Upload Excel file",
+        type=["xlsx", "xls"]
+    )
 else:
-    file_url = st.text_input("Paste share link here")
+    file_url = st.text_input(
+        "Paste share link here"
+    )
 
-run_btn = st.button("🚀 Run Reconciliation", type="primary", disabled=(uploaded is None and not file_url))
+run_btn = st.button(
+    "🚀 Run Reconciliation",
+    type="primary",
+    disabled=(uploaded is None and not file_url)
+)
 
 # ================= KPI DISPLAY FUNCTION =================
 def kpi_card(title, value, note, status_class="status-info"):
@@ -692,68 +879,137 @@ if run_btn:
         with st.spinner("Processing reconciliation..."):
             if file_url:
                 local_path = download_to_temp(file_url)
+
                 with open(local_path, "rb") as f:
                     file_bytes = f.read()
-                try: os.unlink(local_path)
-                except Exception: pass
+
+                try:
+                    os.unlink(local_path)
+                except Exception:
+                    pass
             else:
                 file_bytes = uploaded.read()
 
             matching_df, unmatching_df, out_xlsx = run_recon_cached_v2(
-                file_bytes, our_sheet, branch_sheet, AMOUNT_TOLERANCE_DEFAULT, name_thresh, use_fast, _version="modern-v3"
+                file_bytes,
+                our_sheet,
+                branch_sheet,
+                AMOUNT_TOLERANCE_DEFAULT,
+                name_thresh,
+                use_fast,
+                _version="modern-v3"
             )
 
         st.success("Reconciliation completed successfully.")
+
         matched_count = safe_len(matching_df)
         unmatched_count = safe_len(unmatching_df)
         total_count = matched_count + unmatched_count
-        match_rate = round((matched_count / total_count) * 100, 2) if total_count > 0 else 0
+
+        match_rate = (
+            round((matched_count / total_count) * 100, 2)
+            if total_count > 0
+            else 0
+        )
 
         st.markdown("## 📊 Reconciliation Summary")
+
         c1, c2, c3, c4 = st.columns(4)
-        with c1: kpi_card("Total Items", f"{total_count:,}", "Total processed", "status-info")
-        with c2: kpi_card("Matched", f"{matched_count:,}", "Exact matches", "status-success")
-        with c3: kpi_card("Unmatched", f"{unmatched_count:,}", "Needs review", "status-danger")
-        with c4: kpi_card("Match Rate", f"{match_rate}%", "Overall success", "status-success")
+
+        with c1:
+            kpi_card("Total Items", f"{total_count:,}", "Total processed", "status-info")
+
+        with c2:
+            kpi_card("Matched", f"{matched_count:,}", "Exact matches", "status-success")
+
+        with c3:
+            kpi_card("Unmatched", f"{unmatched_count:,}", "Needs review", "status-danger")
+
+        with c4:
+            kpi_card("Match Rate", f"{match_rate}%", "Overall success", "status-success")
 
         st.markdown("---")
-        tab_summary, tab_match, tab_unmatch, tab_export = st.tabs(["📊 Summary", "✅ Matching", "❌ Unmatching", "⬇ Export"])
+
+        tab_summary, tab_match, tab_unmatch, tab_export = st.tabs([
+            "📊 Summary",
+            "✅ Matching",
+            "❌ Unmatching",
+            "⬇ Export"
+        ])
 
         with tab_summary:
             st.markdown("### 📈 Status Overview")
-            chart_df = pd.DataFrame({"Status": ["Matched", "Unmatched"], "Count": [matched_count, unmatched_count]})
+
+            chart_df = pd.DataFrame({
+                "Status": ["Matched", "Unmatched"],
+                "Count": [matched_count, unmatched_count]
+            })
+
             if chart_df["Count"].sum() > 0:
-                fig = px.pie(chart_df, names="Status", values="Count", hole=0.45, title="Reconciliation Breakdown")
-                fig.update_layout(height=420, showlegend=True, margin=dict(l=20, r=20, t=60, b=20))
+                fig = px.pie(
+                    chart_df,
+                    names="Status",
+                    values="Count",
+                    hole=0.45,
+                    title="Reconciliation Breakdown"
+                )
+                fig.update_layout(
+                    height=420,
+                    showlegend=True,
+                    margin=dict(l=20, r=20, t=60, b=20)
+                )
                 st.plotly_chart(fig, use_container_width=True)
 
-                bar = px.bar(chart_df, x="Status", y="Count", text="Count", title="Transaction Count by Status")
-                bar.update_layout(height=380, margin=dict(l=20, r=20, t=60, b=20))
+                bar = px.bar(
+                    chart_df,
+                    x="Status",
+                    y="Count",
+                    text="Count",
+                    title="Transaction Count by Status"
+                )
+                bar.update_layout(
+                    height=380,
+                    margin=dict(l=20, r=20, t=60, b=20)
+                )
                 st.plotly_chart(bar, use_container_width=True)
             else:
                 st.info("No data available for chart.")
 
         with tab_match:
             st.markdown("### ✅ Exact Matching Transactions")
-            st.dataframe(matching_df if not matching_df.empty else pd.DataFrame({"Info": ["No matches found"]}), use_container_width=True, height=520)
+
+            st.dataframe(
+                matching_df if not matching_df.empty else pd.DataFrame({"Info": ["No matches found"]}),
+                use_container_width=True,
+                height=520
+            )
 
         with tab_unmatch:
             st.markdown("### ❌ Unmatched Transactions")
-            st.dataframe(unmatching_df if not unmatching_df.empty else pd.DataFrame({"Info": ["No unmatching transactions"]}), use_container_width=True, height=520)
+
+            st.dataframe(
+                unmatching_df if not unmatching_df.empty else pd.DataFrame({"Info": ["No unmatching transactions"]}),
+                use_container_width=True,
+                height=520
+            )
 
         with tab_export:
             st.markdown("""
             <div class="section-card status-success">
                 <h3 style="margin-top:0;">⬇ Export Reconciliation Report</h3>
-                <p class="small-muted">Download complete Excel output with Matching and Unmatching sheets.</p>
+                <p class="small-muted">
+                    Download complete Excel output with Matching and Unmatching sheets.
+                </p>
             </div>
             """, unsafe_allow_html=True)
+
             st.download_button(
                 "⬇ Download Complete Excel Report",
                 data=out_xlsx.getvalue(),
                 file_name=f"Branch_Recon_Output_{'FAST' if use_fast else 'ORIG'}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
+
     except Exception as e:
         st.error(str(e))
 
